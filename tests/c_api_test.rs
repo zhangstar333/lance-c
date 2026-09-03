@@ -100,8 +100,79 @@ fn create_large_dataset(num_rows: i32) -> (tempfile::TempDir, String) {
     (tmp, uri)
 }
 
+/// Helper: create two fragments large enough for Lance's batched range-read
+/// path, which is the path wrapped by the Foyer data cache.
+fn create_large_multi_fragment_dataset(num_rows_per_fragment: i32) -> (tempfile::TempDir, String) {
+    let (tmp, uri) = create_large_dataset(num_rows_per_fragment);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("value", DataType::Float32, true),
+        Field::new("label", DataType::Utf8, true),
+    ]));
+    let ids: Vec<i32> = (num_rows_per_fragment..2 * num_rows_per_fragment).collect();
+    let values: Vec<f32> = ids.iter().map(|id| *id as f32 * 0.5).collect();
+    let labels: Vec<String> = ids.iter().map(|id| format!("row_{id}")).collect();
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(Float32Array::from(values)),
+            Arc::new(StringArray::from(label_refs)),
+        ],
+    )
+    .unwrap();
+
+    lance_c::runtime::block_on(async {
+        let mut dataset = Dataset::open(&uri).await.unwrap();
+        dataset
+            .append(
+                arrow::record_batch::RecordBatchIterator::new(vec![Ok(batch)], schema),
+                None,
+            )
+            .await
+            .unwrap();
+    });
+
+    (tmp, uri)
+}
+
 fn c_str(s: &str) -> CString {
     CString::new(s).unwrap()
+}
+
+fn file_object_store_uri(path: &str) -> CString {
+    let path = path.replace('\\', "/");
+    let leading_slash = if path.starts_with('/') { "" } else { "/" };
+    c_str(&format!("file-object-store://{leading_slash}{path}"))
+}
+
+fn create_data_cache_session() -> (tempfile::TempDir, *mut LanceSession) {
+    let directory = tempfile::tempdir().unwrap();
+    let c_directory = c_str(directory.path().to_str().unwrap());
+    let options = LanceFoyerCacheOptions {
+        directory: c_directory.as_ptr(),
+        disk_capacity_bytes: 64 * 1024 * 1024,
+    };
+    let session = unsafe { lance_session_new_with_foyer_cache(0, 16 * 1024 * 1024, &options) };
+    assert!(!session.is_null(), "data-cache session should be created");
+    (directory, session)
+}
+
+fn data_cache_statistics(dataset: *const LanceDataset) -> LanceDataCacheStatistics {
+    let mut statistics = LanceDataCacheStatistics::default();
+    assert_eq!(
+        unsafe { lance_dataset_get_data_cache_statistics(dataset, &mut statistics) },
+        0
+    );
+    statistics
+}
+
+fn scanned_row_count(dataset: *const LanceDataset) -> usize {
+    scan_all_rows(dataset)
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum()
 }
 
 #[derive(Default)]
@@ -443,6 +514,275 @@ fn test_shared_session_rejects_null_inputs() {
         lance_session_close(session);
         lance_session_close(ptr::null_mut());
     }
+}
+
+#[test]
+fn test_session_with_foyer_cache_validates_options() {
+    let session = unsafe { lance_session_new_with_foyer_cache(0, 0, ptr::null()) };
+    assert!(!session.is_null());
+    let mut stats = LanceIndexDiskCacheStats::default();
+    assert_eq!(
+        unsafe { lance_session_get_index_disk_cache_stats(session, &mut stats) },
+        0
+    );
+    assert_eq!(stats, LanceIndexDiskCacheStats::default());
+    assert_eq!(
+        unsafe { lance_session_get_index_disk_cache_stats(session, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(
+        unsafe { lance_session_get_index_disk_cache_stats(ptr::null(), &mut stats) },
+        -1
+    );
+    unsafe { lance_session_close(session) };
+
+    let directory = tempfile::tempdir().unwrap();
+    let c_directory = c_str(directory.path().to_str().unwrap());
+    let empty = c_str("");
+    for (path, capacity) in [
+        (ptr::null(), 64 * 1024 * 1024),
+        (empty.as_ptr(), 64 * 1024 * 1024),
+        (c_directory.as_ptr(), 0),
+        (c_directory.as_ptr(), 64 * 1024 * 1024 - 4096),
+        (c_directory.as_ptr(), 64 * 1024 * 1024 + 1),
+    ] {
+        let options = LanceFoyerCacheOptions {
+            directory: path,
+            disk_capacity_bytes: capacity,
+        };
+        assert!(unsafe { lance_session_new_with_foyer_cache(0, 0, &options) }.is_null());
+        assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    }
+
+    let options = LanceFoyerCacheOptions {
+        directory: c_directory.as_ptr(),
+        disk_capacity_bytes: 64 * 1024 * 1024,
+    };
+    let session = unsafe { lance_session_new_with_foyer_cache(0, 0, &options) };
+    assert!(!session.is_null());
+    assert!(unsafe { lance_session_new_with_foyer_cache(0, 0, &options) }.is_null());
+    unsafe { lance_session_close(session) };
+}
+
+#[test]
+fn test_session_with_foyer_cache_shares_data_and_index_across_fragments() {
+    let (_tmp, uri) = create_large_multi_fragment_dataset(10_000);
+    let c_uri = file_object_store_uri(&uri);
+    let source = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!source.is_null());
+    let column = c_str("id");
+    assert_eq!(
+        unsafe {
+            lance_dataset_create_scalar_index(
+                source,
+                column.as_ptr(),
+                ptr::null(),
+                LanceScalarIndexType::BTree as i32,
+                ptr::null(),
+                false,
+            )
+        },
+        0
+    );
+    unsafe { lance_dataset_close(source) };
+
+    let query = |dataset: *const LanceDataset| {
+        let filter = c_str("id = 3 OR id = 10003");
+        let scanner = unsafe { lance_scanner_new(dataset, ptr::null(), filter.as_ptr()) };
+        assert!(!scanner.is_null());
+        let mut stream = FFI_ArrowArrayStream::empty();
+        assert_eq!(
+            unsafe { lance_scanner_to_arrow_stream(scanner, &mut stream) },
+            0
+        );
+        let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.unwrap();
+        let mut ids = reader
+            .flat_map(|batch| {
+                batch
+                    .unwrap()
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![3, 10003]);
+        unsafe { lance_scanner_close(scanner) };
+    };
+
+    let disk_stats = |session: *const LanceSession| {
+        let mut stats = LanceIndexDiskCacheStats::default();
+        assert_eq!(
+            unsafe { lance_session_get_index_disk_cache_stats(session, &mut stats) },
+            0
+        );
+        stats
+    };
+    let session_stats = |session: *const LanceSession| {
+        let mut stats = LanceSessionCacheStats::default();
+        assert_eq!(
+            unsafe { lance_session_get_cache_stats(session, &mut stats) },
+            0
+        );
+        stats
+    };
+
+    for l1_capacity in [0, 16 * 1024 * 1024] {
+        let directory = tempfile::tempdir().unwrap();
+        let c_directory = c_str(directory.path().to_str().unwrap());
+        let options = LanceFoyerCacheOptions {
+            directory: c_directory.as_ptr(),
+            disk_capacity_bytes: 128 * 1024 * 1024,
+        };
+        // The second session has cold L1 and no pending-write buffers from the
+        // first session. Its index and data hits must come from persisted L2.
+        for reopened in [false, true] {
+            let session = unsafe {
+                lance_session_new_with_foyer_cache(l1_capacity, 16 * 1024 * 1024, &options)
+            };
+            assert!(!session.is_null());
+            let dataset =
+                unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+            assert!(!dataset.is_null());
+            assert_eq!(scanned_row_count(dataset), 20_000);
+            let data = data_cache_statistics(dataset);
+            if reopened {
+                assert!(data.bytes_read_from_cache > 0);
+                assert_eq!(data.bytes_read_from_remote, 0);
+            } else {
+                assert!(data.bytes_read_from_remote > 0);
+            }
+
+            query(dataset);
+            let before = disk_stats(session);
+            let overall_before = session_stats(session);
+            if reopened {
+                assert!(before.disk_hits > 0);
+                assert!(before.disk_read_bytes > 0);
+                assert_eq!(before.decode_failures, 0);
+            } else {
+                assert!(before.disk_write_bytes > 0);
+            }
+
+            query(dataset);
+            let after = disk_stats(session);
+            let overall_after = session_stats(session);
+            if l1_capacity == 0 {
+                assert!(after.disk_hits > before.disk_hits);
+                assert!(after.memory_misses > before.memory_misses);
+                assert_eq!(overall_after.index_cache_size_bytes, 0);
+            } else {
+                assert!(after.memory_hits > before.memory_hits);
+                assert_eq!(after.memory_misses, before.memory_misses);
+                assert_eq!(after.disk_hits, before.disk_hits);
+                assert_eq!(after.disk_misses, before.disk_misses);
+                assert_eq!(after.disk_read_bytes, before.disk_read_bytes);
+                assert!(overall_after.index_cache_size_bytes > 0);
+                assert!(overall_after.index_cache_size_bytes <= l1_capacity);
+            }
+            assert!(overall_after.metadata_cache_size_bytes > 0);
+            assert!(overall_after.metadata_cache_size_bytes <= 16 * 1024 * 1024);
+            assert!(overall_after.index_cache_hits > overall_before.index_cache_hits);
+            assert!(!directory.path().join("index").exists());
+
+            unsafe { lance_session_close(session) };
+            assert_eq!(scanned_row_count(dataset), 20_000);
+            assert!(data_cache_statistics(dataset).bytes_read_from_cache > 0);
+            unsafe { lance_dataset_close(dataset) };
+
+            // Closing the final owner drains Foyer asynchronously. Wait for its
+            // directory lock instead of retrying session construction or sleeping
+            // for a guessed flush duration.
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(directory.path().join("lance-cache-layout"))
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match lock.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "cache owners did not release directory"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("failed to check cache directory lock: {error}"),
+                }
+            }
+            lock.unlock().unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_session_with_data_cache_serves_repeated_scan() {
+    let (tmp, uri) = create_large_multi_fragment_dataset(10_000);
+    let c_uri = file_object_store_uri(&uri);
+    let (_cache_directory, session) = create_data_cache_session();
+
+    let dataset =
+        unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+    assert!(!dataset.is_null(), "dataset open should succeed");
+
+    assert_eq!(data_cache_statistics(dataset), Default::default());
+    assert_eq!(scanned_row_count(dataset), 20_000);
+    let first_statistics = data_cache_statistics(dataset);
+    assert!(first_statistics.bytes_read_from_remote > 0);
+
+    let cached_dataset =
+        unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+    assert!(
+        !cached_dataset.is_null(),
+        "second dataset open should succeed"
+    );
+    unsafe { lance_session_close(session) };
+
+    for entry in std::fs::read_dir(tmp.path().join("large_ds/data")).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    assert_eq!(scanned_row_count(cached_dataset), 20_000);
+    let cached_statistics = data_cache_statistics(cached_dataset);
+    assert!(cached_statistics.bytes_read_from_cache > 0);
+    assert_eq!(cached_statistics.bytes_read_from_remote, 0);
+
+    assert_eq!(data_cache_statistics(dataset), first_statistics);
+
+    unsafe { lance_dataset_close(cached_dataset) };
+    unsafe { lance_dataset_close(dataset) };
+}
+
+#[test]
+fn test_dataset_data_cache_statistics_validates_inputs_and_defaults_to_zero() {
+    let (_tmp, uri) = create_test_dataset();
+    let c_uri = c_str(&uri);
+    let dataset = unsafe { lance_dataset_open(c_uri.as_ptr(), ptr::null(), 0) };
+    assert!(!dataset.is_null());
+
+    let mut statistics = LanceDataCacheStatistics::default();
+    assert_eq!(
+        unsafe { lance_dataset_get_data_cache_statistics(dataset, &mut statistics) },
+        0
+    );
+    assert_eq!(statistics, LanceDataCacheStatistics::default());
+    assert_eq!(
+        unsafe { lance_dataset_get_data_cache_statistics(ptr::null(), &mut statistics) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+    assert_eq!(
+        unsafe { lance_dataset_get_data_cache_statistics(dataset, ptr::null_mut()) },
+        -1
+    );
+    assert_eq!(lance_last_error_code(), LanceErrorCode::InvalidArgument);
+
+    unsafe { lance_dataset_close(dataset) };
 }
 
 #[test]
@@ -3316,6 +3656,40 @@ fn test_dataset_restore_to_prior_version() {
 
     unsafe { lance_dataset_close(restored) };
     unsafe { lance_dataset_close(ds) };
+}
+
+#[test]
+fn test_restored_handle_has_independent_data_cache_statistics() {
+    let (_tmp, uri) = create_large_multi_fragment_dataset(10_000);
+    let c_uri = file_object_store_uri(&uri);
+    let (_cache_directory, session) = create_data_cache_session();
+    let source =
+        unsafe { lance_dataset_open_with_session(c_uri.as_ptr(), ptr::null(), 0, session) };
+    assert!(!source.is_null());
+
+    assert_eq!(scanned_row_count(source), 20_000);
+    let source_statistics = data_cache_statistics(source);
+    assert!(source_statistics.bytes_read_from_remote > 0);
+
+    let restored = unsafe { lance_dataset_restore(source, 1) };
+    assert!(!restored.is_null());
+    assert_eq!(data_cache_statistics(restored), Default::default());
+    let source_statistics_after_restore = data_cache_statistics(source);
+
+    assert_eq!(scanned_row_count(restored), 10_000);
+    let restored_statistics = data_cache_statistics(restored);
+    assert!(restored_statistics.bytes_read_from_cache > 0);
+
+    assert_eq!(
+        data_cache_statistics(source),
+        source_statistics_after_restore
+    );
+
+    unsafe {
+        lance_session_close(session);
+        lance_dataset_close(restored);
+        lance_dataset_close(source);
+    }
 }
 
 #[test]

@@ -215,6 +215,53 @@ typedef struct LanceSessionCacheStats {
 } LanceSessionCacheStats;
 
 /**
+ * One shared L2 disk cache for immutable data-file blocks and serializable index
+ * entries. Both use the same directory and total capacity, with no per-type quota.
+ * Share one session per directory. Use a new directory when changing capacity.
+ * Block sizes are managed internally (1 MiB data reads, 16 MiB storage blocks).
+ */
+typedef struct LanceFoyerCacheOptions {
+    const char* directory;
+    /** Total disk capacity in bytes; a multiple of 4096 and at least 64 MiB. */
+    uint64_t disk_capacity_bytes;
+} LanceFoyerCacheOptions;
+
+/**
+ * Cumulative L1 index and L2 serialized-index statistics for one shared session.
+ *
+ * `memory_*` counts the Session's L1 index cache (including coalesced requests).
+ * `disk_*` counts lookups issued to Foyer L2 after an L1 miss. An L2 hit
+ * increments memory_misses and disk_hits; it is a hit in LanceSessionCacheStats.
+ * L2 hits/read bytes may be served from pending-write buffers and do not
+ * measure physical disk I/O.
+ * disk_write_bytes counts serialized bytes submitted, not confirmed disk writes.
+ * disk_write_errors counts serialization failures, not background I/O failures.
+ */
+typedef struct LanceIndexDiskCacheStats {
+    uint64_t memory_hits;
+    uint64_t memory_misses;
+    uint64_t disk_hits;
+    uint64_t disk_misses;
+    uint64_t disk_read_bytes;
+    uint64_t disk_write_bytes;
+    uint64_t decode_failures;
+    uint64_t disk_read_errors;
+    uint64_t disk_write_errors;
+} LanceIndexDiskCacheStats;
+
+/**
+ * Cumulative Foyer data-cache statistics for one opened dataset handle.
+ *
+ * Successful reads are accumulated. Both fields measure bytes returned to the
+ * dataset reader. Their sum is the logical data-file range bytes observed by
+ * the Foyer wrapper; block-aligned origin read amplification is not included.
+ */
+typedef struct LanceDataCacheStatistics {
+    uint64_t bytes_read_from_cache;
+    uint64_t bytes_read_from_remote;
+} LanceDataCacheStatistics;
+
+/**
  * Create a session that can share metadata and index caches across datasets.
  *
  * Cache limits are specified in bytes. Pass 0 to request zero capacity.
@@ -223,6 +270,22 @@ typedef struct LanceSessionCacheStats {
 LanceSession* lance_session_new(
     uint64_t index_cache_size_bytes,
     uint64_t metadata_cache_size_bytes
+);
+
+/**
+ * Create a session with one shared Foyer disk cache for data files and index
+ * entries. NULL options disable the disk cache. A non-NULL options pointer
+ * requires a non-empty UTF-8 directory and a valid positive disk capacity.
+ * Values are copied before return. Index and metadata memory budgets remain
+ * controlled by the first two arguments (L1). Foyer L2 adds no memory-cache
+ * capacity. Metadata does not enter L2.
+ *
+ * @return Session handle, or NULL on error
+ */
+LanceSession* lance_session_new_with_foyer_cache(
+    uint64_t index_cache_size_bytes,
+    uint64_t metadata_cache_size_bytes,
+    const LanceFoyerCacheOptions* foyer_cache_options
 );
 
 /**
@@ -239,6 +302,12 @@ void lance_session_close(LanceSession* session);
 int32_t lance_session_get_cache_stats(
     const LanceSession* session,
     LanceSessionCacheStats* out_stats
+);
+
+/** Copy current index disk-tier statistics to `out_stats`. */
+int32_t lance_session_get_index_disk_cache_stats(
+    const LanceSession* session,
+    LanceIndexDiskCacheStats* out_stats
 );
 
 /* ─── Dataset lifecycle ─── */
@@ -279,6 +348,20 @@ LanceDataset* lance_dataset_open_with_session(
     const char* const* storage_opts,
     uint64_t version,
     const LanceSession* session
+);
+
+/**
+ * Copy this dataset handle's cumulative data-cache statistics.
+ *
+ * A dataset not opened with a data cache reports all-zero statistics. The
+ * snapshot belongs only to this dataset handle; the underlying cache may
+ * still be shared by other datasets through a session.
+ *
+ * @return 0 on success, -1 on error
+ */
+int32_t lance_dataset_get_data_cache_statistics(
+    const LanceDataset* dataset,
+    LanceDataCacheStatistics* out_statistics
 );
 
 /** Close and free a dataset handle. Safe to call with NULL. */

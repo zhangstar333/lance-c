@@ -176,6 +176,11 @@ struct SqlColumn {
 
 // ─── Shared Session ──────────────────────────────────────────────────────────
 
+struct FoyerCacheOptions {
+    std::string directory;
+    uint64_t disk_capacity_bytes;
+};
+
 class Session {
     Handle<LanceSession, lance_session_close> handle_;
 
@@ -185,9 +190,29 @@ public:
         if (!handle_) check_error();
     }
 
+    Session(uint64_t index_cache_size_bytes,
+            uint64_t metadata_cache_size_bytes,
+            const FoyerCacheOptions& foyer_cache_options) {
+        LanceFoyerCacheOptions options{
+            foyer_cache_options.directory.c_str(),
+            foyer_cache_options.disk_capacity_bytes,
+        };
+        handle_ = Handle<LanceSession, lance_session_close>(
+            lance_session_new_with_foyer_cache(
+                index_cache_size_bytes, metadata_cache_size_bytes, &options));
+        if (!handle_) check_error();
+    }
+
     LanceSessionCacheStats cache_stats() const {
         LanceSessionCacheStats stats{};
         if (lance_session_get_cache_stats(handle_.get(), &stats) != 0)
+            check_error();
+        return stats;
+    }
+
+    LanceIndexDiskCacheStats index_disk_cache_stats() const {
+        LanceIndexDiskCacheStats stats{};
+        if (lance_session_get_index_disk_cache_stats(handle_.get(), &stats) != 0)
             check_error();
         return stats;
     }
@@ -348,6 +373,13 @@ public:
             uri.c_str(), opts_ptr, version, session.c_handle());
         if (!ds) check_error();
         return Dataset(ds);
+    }
+
+    LanceDataCacheStatistics data_cache_statistics() const {
+        LanceDataCacheStatistics statistics{};
+        if (lance_dataset_get_data_cache_statistics(handle_.get(), &statistics) != 0)
+            check_error();
+        return statistics;
     }
 
     /// Write an Arrow record batch stream to a Lance dataset and return the

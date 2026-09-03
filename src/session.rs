@@ -7,13 +7,18 @@ use std::sync::Arc;
 
 use lance::session::Session;
 use lance_core::Result;
+use lance_core::cache::CacheBackend;
 
+use crate::data_cache::DataCacheFactory;
 use crate::error::{ffi_try, swallow_unwind};
+use crate::foyer_index_cache::IndexDiskCacheStats;
 use crate::runtime::block_on;
 
-/// Opaque handle for sharing Lance metadata and index caches across datasets.
+/// Opaque handle for shared Lance caches across datasets.
 pub struct LanceSession {
     pub(crate) inner: Arc<Session>,
+    pub(crate) data_cache_factory: Option<Arc<dyn DataCacheFactory>>,
+    pub(crate) index_disk_cache_stats: Option<Arc<IndexDiskCacheStats>>,
 }
 
 /// Snapshot of a session's metadata and index cache statistics.
@@ -48,16 +53,41 @@ fn session_new_inner(
     index_cache_size_bytes: u64,
     metadata_cache_size_bytes: u64,
 ) -> Result<*mut LanceSession> {
+    session_new_with_factories(
+        index_cache_size_bytes,
+        metadata_cache_size_bytes,
+        None,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn session_new_with_factories(
+    index_cache_size_bytes: u64,
+    metadata_cache_size_bytes: u64,
+    index_cache_backend: Option<Arc<dyn CacheBackend>>,
+    index_disk_cache_stats: Option<Arc<IndexDiskCacheStats>>,
+    data_cache_factory: Option<Arc<dyn DataCacheFactory>>,
+) -> Result<*mut LanceSession> {
     let index_cache_size_bytes = u64_to_usize(index_cache_size_bytes, "index_cache_size_bytes")?;
     let metadata_cache_size_bytes =
         u64_to_usize(metadata_cache_size_bytes, "metadata_cache_size_bytes")?;
-    let session = Session::new(
-        index_cache_size_bytes,
-        metadata_cache_size_bytes,
-        Default::default(),
-    );
+    let session = match index_cache_backend {
+        Some(backend) => Session::with_index_cache_backend(
+            backend,
+            metadata_cache_size_bytes,
+            Default::default(),
+        ),
+        None => Session::new(
+            index_cache_size_bytes,
+            metadata_cache_size_bytes,
+            Default::default(),
+        ),
+    };
     Ok(Box::into_raw(Box::new(LanceSession {
         inner: Arc::new(session),
+        data_cache_factory,
+        index_disk_cache_stats,
     })))
 }
 
@@ -119,7 +149,7 @@ unsafe fn session_get_cache_stats_inner(
     Ok(0)
 }
 
-fn u64_to_usize(value: u64, field: &'static str) -> Result<usize> {
+pub(crate) fn u64_to_usize(value: u64, field: &'static str) -> Result<usize> {
     usize::try_from(value).map_err(|_| {
         lance_core::Error::invalid_input_source(
             format!("{field}={value} exceeds usize::MAX on this target").into(),

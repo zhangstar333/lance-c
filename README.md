@@ -68,6 +68,7 @@ Based on the [liblance RFC](https://github.com/lance-format/lance/discussions/60
 | [x] | Async scan | Callback-based `lance_scanner_scan_async()` for non-blocking scans |
 | [x] | Dataset metadata | `lance_dataset_version()`, `lance_dataset_count_rows()`, `lance_dataset_latest_version()` |
 | [x] | Filter pushdown | `lance_scanner_set_substrait_filter()` accepts a serialized Substrait `ExtendedExpression`; `lance_scanner_additional_sql_filter()` adds SQL predicates with AND before scanning starts |
+| [x] | Data-file cache | Optional Foyer disk cache shared with serializable index entries |
 
 ## Multi-vector search
 
@@ -230,6 +231,42 @@ lance::Session session(
 auto ds = lance::Dataset::open_with_session(session, "data.lance");
 auto stats = session.cache_stats();
 ```
+
+To cache remote Lance data and serializable index entries on disk, configure
+one Foyer directory and total capacity. Data-file blocks and serialized index
+entries share that capacity and eviction pool. L1 is the Session's index and
+metadata memory caches, with their existing separate budgets. L2 is the shared
+Foyer disk cache; Foyer's memory-cache capacity is zero. Index entries follow
+L1 -> L2 -> origin, data-file blocks follow L2 -> origin, and metadata keeps its
+existing L1 -> origin path. Data reads cover direct `data/*.lance` children; index
+entries use Lance's `CacheCodec` rather than caching raw index files. Manifests,
+deletion files, and conditional/versioned data reads keep their normal paths.
+Share one session per cache directory; concurrent owners are rejected. A change
+to capacity or disk layout requires a new directory. Capacity must be a multiple
+of 4096 and at least 64 MiB. Data reads use 1 MiB blocks; disk storage uses 16 MiB
+blocks, so a trailing partial storage block is unused. Serialized entries that
+exceed the storage block's payload limit remain eligible for the memory cache
+but cannot be retained on disk. Cache writes are
+asynchronous; recovery can reuse fully persisted entries but is not a durability
+guarantee.
+
+```cpp
+lance::FoyerCacheOptions disk_cache{
+    "/var/cache/my-service/lance",
+    100ULL * 1024 * 1024 * 1024, // total data + index disk capacity
+};
+lance::Session session(
+    6ULL * 1024 * 1024 * 1024, // L1 index capacity
+    1ULL * 1024 * 1024 * 1024, // L1 metadata capacity
+    disk_cache);
+auto ds = lance::Dataset::open_with_session(session, "s3://bucket/data.lance");
+```
+
+Index cache statistics expose L1 `memory_hits`/`memory_misses` and L2
+`disk_hits`/`disk_misses` separately. An L2 hit counts as an L1 miss and an L2 hit.
+The Session's aggregate index hit counter includes both tiers: its backend's
+`was_cached` result means the origin loader was skipped. Requests coalesced by
+L1 also count as hits. Data-file byte statistics remain scoped to each dataset.
 
 ### Open at a specific version
 
