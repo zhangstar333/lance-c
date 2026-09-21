@@ -1280,6 +1280,27 @@ public:
         return std::vector<uint8_t>(guard.bytes, guard.bytes + len);
     }
 
+    /// Register a non-null index-build progress callback. Must be called
+    /// before execute_uncommitted; the builder is single-use. The callback is
+    /// invoked from internal worker threads and may be called concurrently
+    /// from parallel worker tasks, so it must be thread-safe, non-blocking,
+    /// and must not re-enter any lance_* function. It must return normally;
+    /// unwinding or throwing across this boundary can abort the host process.
+    /// Invocations occur only while execute_uncommitted runs, and this is
+    /// enforced: lance-c disables the callback and drains in-flight
+    /// invocations before that call returns, including on error, so a worker
+    /// task detached by core can never invoke it afterwards. The callback and
+    /// the context (if non-null) must remain valid until execute_uncommitted
+    /// returns. Progress reporting is advisory and cannot affect the build
+    /// outcome.
+    IndexSegmentBuilder& progress_callback(LanceIndexBuildProgressCallback callback,
+                                           void* callback_ctx) {
+        if (lance_index_segment_builder_set_progress_callback(handle_.get(), callback,
+                                                              callback_ctx) != 0)
+            check_error();
+        return *this;
+    }
+
     LanceIndexSegmentBuilder* c_handle() { return handle_.get(); }
 };
 

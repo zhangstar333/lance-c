@@ -1816,6 +1816,88 @@ int32_t lance_index_segment_builder_execute_uncommitted(
     size_t* out_len
 );
 
+/**
+ * Event codes for LanceIndexBuildProgressCallback, passed as the `event`
+ * argument. Exactly one stage is active at a time: a stage's
+ * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE is always delivered before the
+ * next stage's LANCE_INDEX_BUILD_PROGRESS_STAGE_START.
+ */
+typedef enum {
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_START = 0,
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS = 1,
+    LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE = 2,
+} LanceIndexBuildProgressEvent;
+
+/**
+ * Receives index build progress events while
+ * lance_index_segment_builder_execute_uncommitted runs.
+ *
+ * `stage` is non-NULL, NUL-terminated, and borrowed: it is valid only for the
+ * duration of this call. `unit` is non-NULL and NUL-terminated, but is the
+ * empty string ("") for LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS and
+ * LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE. The parameter mapping is:
+ *
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_START: `stage` is the stage name,
+ *    `total` is the number of work units (0 = unknown), `unit` describes what
+ *    is being counted (e.g. "partitions", "batches", "rows"; "" = unknown),
+ *    and `completed` is 0.
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_PROGRESS: `total` is 0, `unit` is "",
+ *    and `completed` is the number of units completed so far.
+ *  - LANCE_INDEX_BUILD_PROGRESS_STAGE_COMPLETE: `total` is 0, `unit` is "",
+ *    and `completed` is 0.
+ *
+ * Stage names are index-type-specific (e.g. "train_ivf", "shuffle",
+ * "merge_partitions" for vector indices; "load_data" for scalar indices) and
+ * are diagnostic-only: they are not a stable cross-version contract, so
+ * consumers must treat them as opaque strings.
+ *
+ * The callback is invoked from lance-c's internal tokio runtime worker
+ * threads. Certain stages report progress concurrently from parallel worker
+ * tasks, so the callback MUST be thread-safe and reentrant. It must be
+ * non-blocking and must not call back into any `lance_*` function (no
+ * reentrancy).
+ *
+ * The callback is invoked without a panic guard: it must return normally,
+ * because unwinding or throwing across this boundary can abort the host
+ * process. The callback cannot abort the build; progress reporting is
+ * advisory and diagnostic and cannot affect the build outcome.
+ */
+typedef void (*LanceIndexBuildProgressCallback)(
+    void* callback_ctx,
+    int32_t event,
+    const char* stage,
+    uint64_t total,
+    const char* unit,
+    uint64_t completed
+);
+
+/**
+ * Register the index-build progress callback for a segment builder.
+ *
+ * Must be called before the builder is executed; the builder is single-use,
+ * so calling it after lance_index_segment_builder_execute_uncommitted has
+ * been called (even if that call failed) returns -1. `callback` must not be
+ * NULL. `callback_ctx` may be NULL and is passed through to the callback
+ * opaquely. Setting a callback replaces any previously set callback.
+ *
+ * Invocations occur only while lance_index_segment_builder_execute_uncommitted
+ * is executing, and this is enforced rather than contractual: lance-c
+ * disables the callback and drains in-flight invocations through a retirement
+ * gate before that call returns, including on error, so a worker task
+ * detached by lance core on an error path can never invoke the callback
+ * afterwards. `callback` and `callback_ctx` must therefore remain valid and
+ * safe to invoke until lance_index_segment_builder_execute_uncommitted
+ * returns. See LanceIndexBuildProgressCallback for the full threading and
+ * reentrancy contract.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int32_t lance_index_segment_builder_set_progress_callback(
+    LanceIndexSegmentBuilder* builder,
+    LanceIndexBuildProgressCallback callback,
+    void* callback_ctx
+);
+
 /** Free metadata bytes returned by an uncommitted segment build. NULL-safe. */
 void lance_free_bytes(uint8_t* bytes);
 
